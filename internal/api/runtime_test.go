@@ -109,6 +109,150 @@ func TestEphemerisClockAndWindSafetyFlow(t *testing.T) {
 	}
 }
 
+func TestDecoderGapRetransmissionAPI(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+	value := runtime.Passes.List()[0]
+	if _, err := runtime.RF.Apply(rf.Plan{PassID: value.ID, ChainID: "RF-01", CenterHz: 2_245_000_000, DopplerHz: 12_000, Polarization: rf.RightCircular}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.RF.Apply(rf.Plan{PassID: value.ID, ChainID: "RF-02", CenterHz: 2_245_000_000, DopplerHz: 12_050, Polarization: rf.RightCircular}); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := runtime.Attempts.Begin(value.ID, "RF-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Passes.BeginAcquisition(value.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	results := []receiver.AcquisitionResult{
+		{PassID: value.ID, AttemptID: attempt.ID, ChainID: "RF-01", Locked: true, Synced: true, Epoch: 3},
+		{PassID: value.ID, AttemptID: attempt.ID, ChainID: "RF-02", Locked: true, Synced: true, Epoch: 3},
+	}
+	if _, err := runtime.Passes.AcceptDiversity(value.ID, results); err != nil {
+		t.Fatal(err)
+	}
+	segment, found := runtime.Recorder.ActiveForPass(value.ID)
+	if !found {
+		t.Fatal("acquisition did not open a recording segment")
+	}
+	post := func(target string, payload any) *http.Response {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return requestJSON(t, server.Client(), http.MethodPost, server.URL+target, string(body))
+	}
+	response := post("/api/passes/"+value.ID+"/receiver/lock", map[string]any{"attempt_id": attempt.ID})
+	var locked struct {
+		Epoch int64 `json:"epoch"`
+	}
+	decodeBody(t, response, &locked)
+	if locked.Epoch != 1 {
+		t.Fatalf("first lock opened epoch %d", locked.Epoch)
+	}
+	// 74 bytes assemble one 64-byte frame and leave a 10-symbol partial frame.
+	response = post("/api/passes/"+value.ID+"/receiver/symbols", map[string]any{"attempt_id": attempt.ID, "symbols": make([]byte, 74)})
+	var fed struct {
+		Frames int `json:"frames_buffered"`
+	}
+	decodeBody(t, response, &fed)
+	if fed.Frames != 1 {
+		t.Fatalf("expected 1 assembled frame, got %d", fed.Frames)
+	}
+	// A new receive attempt rolls the epoch and opens a gap at sequence 2.
+	attempt2, err := runtime.Attempts.Begin(value.ID, "RF-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = post("/api/passes/"+value.ID+"/receiver/lock", map[string]any{"attempt_id": attempt2.ID})
+	decodeBody(t, response, &locked)
+	if locked.Epoch != 2 {
+		t.Fatalf("second lock opened epoch %d", locked.Epoch)
+	}
+	var report struct {
+		CurrentEpoch int64 `json:"current_epoch"`
+		LostSymbols  int   `json:"lost_symbols"`
+		Gaps         []struct {
+			Epoch          int64  `json:"epoch"`
+			AttemptID      string `json:"attempt_id"`
+			Sequence       uint64 `json:"sequence"`
+			MissingSymbols int    `json:"missing_symbols"`
+			Status         string `json:"status"`
+			RepairedBy     string `json:"repaired_by"`
+		} `json:"gaps"`
+	}
+	response, err = server.Client().Get(server.URL + "/api/passes/" + value.ID + "/decoder/gaps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeBody(t, response, &report)
+	if report.CurrentEpoch != 2 || report.LostSymbols != 10 || len(report.Gaps) != 1 {
+		t.Fatalf("gap report wrong after rollover: %#v", report)
+	}
+	gap := report.Gaps[0]
+	if gap.Epoch != 1 || gap.AttemptID != attempt.ID || gap.Sequence != 2 || gap.MissingSymbols != 54 || gap.Status != "open" {
+		t.Fatalf("gap not keyed by epoch/sequence/attempt: %#v", gap)
+	}
+	// Retransmit the missing tail on the live attempt; the old epoch is repaired.
+	response = post("/api/passes/"+value.ID+"/receiver/retransmit", map[string]any{"attempt_id": attempt2.ID, "epoch": 1, "symbols": make([]byte, 54)})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("retransmit returned %d", response.StatusCode)
+	}
+	var repair struct {
+		Repaired  bool   `json:"repaired"`
+		SegmentID string `json:"segment_id"`
+		Frame     *struct {
+			Sequence uint64 `json:"sequence"`
+			Epoch    int64  `json:"epoch"`
+		} `json:"frame"`
+	}
+	decodeBody(t, response, &repair)
+	if !repair.Repaired || repair.Frame == nil || repair.Frame.Sequence != 2 || repair.Frame.Epoch != 1 || repair.SegmentID != segment.ID {
+		t.Fatalf("repair result not linked to the segment: %#v", repair)
+	}
+	response, err = server.Client().Get(server.URL + "/api/passes/" + value.ID + "/decoder/gaps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeBody(t, response, &report)
+	if report.Gaps[0].Status != "repaired" || report.Gaps[0].RepairedBy != attempt2.ID {
+		t.Fatalf("gap not marked repaired: %#v", report.Gaps[0])
+	}
+	response, err = server.Client().Get(server.URL + "/api/recordings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recordings struct {
+		Items []struct {
+			ID             string `json:"id"`
+			FramesRepaired int    `json:"frames_repaired"`
+		} `json:"items"`
+	}
+	decodeBody(t, response, &recordings)
+	repaired := -1
+	for _, item := range recordings.Items {
+		if item.ID == segment.ID {
+			repaired = item.FramesRepaired
+		}
+	}
+	if repaired != 1 {
+		t.Fatalf("segment frames_repaired = %d, want 1", repaired)
+	}
+	// A second retransmission for the repaired gap is rejected.
+	response = post("/api/passes/"+value.ID+"/receiver/retransmit", map[string]any{"attempt_id": attempt2.ID, "epoch": 1, "symbols": make([]byte, 1)})
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("double repair returned %d", response.StatusCode)
+	}
+	_ = response.Body.Close()
+}
+
 func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	runtime := newTestRuntime(t)
 	first := runtime.Passes.List()[0]

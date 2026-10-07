@@ -158,6 +158,38 @@ func (r *Runtime) feedSymbols(writer http.ResponseWriter, request *http.Request)
 	writeJSON(writer, http.StatusAccepted, map[string]any{"frames_buffered": frames})
 }
 
+func (r *Runtime) retransmitSymbols(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		AttemptID string `json:"attempt_id"`
+		Epoch     int64  `json:"epoch"`
+		Symbols   []byte `json:"symbols"`
+	}
+	if err := decodeJSON(request, &input); err != nil {
+		writeError(writer, err)
+		return
+	}
+	session, err := r.receiverSession(chi.URLParam(request, "passID"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	result, err := session.FeedRepair(input.AttemptID, input.Epoch, input.Symbols)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, result)
+}
+
+func (r *Runtime) decoderGaps(writer http.ResponseWriter, request *http.Request) {
+	session, err := r.receiverSession(chi.URLParam(request, "passID"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, session.DecoderReport())
+}
+
 func (r *Runtime) listClockCorrections(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]any{"items": r.Clock.Corrections()})
 }

@@ -85,6 +85,32 @@ func (m *Manager) Buffer(segmentID string, frame Frame) error {
 	return nil
 }
 
+// BufferRepaired appends a frame re-assembled from a retransmission. The
+// repair is counted on the segment and persisted immediately, so the
+// recording durably reflects that one of its sequence holes was filled.
+func (m *Manager) BufferRepaired(segmentID string, frame Frame) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, found := m.sessions[segmentID]
+	if !found {
+		return fmt.Errorf("recording segment %s not found", segmentID)
+	}
+	if current.segment.Status != Open {
+		return fmt.Errorf("recording segment %s is not accepting frames", segmentID)
+	}
+	if frame.Received.IsZero() {
+		frame.Received = time.Now().UTC()
+	}
+	current.buffer = append(current.buffer, frame)
+	current.segment.FramesBuffered = len(current.buffer)
+	current.segment.FramesRepaired++
+	if err := m.flushLocked(); err != nil {
+		return err
+	}
+	_, _ = m.audit.Record(audit.Event{Component: "recorder", Action: "repair.buffered", Subject: segmentID, Fields: map[string]any{"sequence": frame.Sequence, "epoch": frame.Epoch, "frames_repaired": current.segment.FramesRepaired}})
+	return nil
+}
+
 func (m *Manager) ActiveForPass(passID string) (Segment, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

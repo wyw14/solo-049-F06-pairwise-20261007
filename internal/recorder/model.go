@@ -27,6 +27,7 @@ type Segment struct {
 	Status          SegmentStatus `json:"status"`
 	FramesWritten   int           `json:"frames_written"`
 	FramesBuffered  int           `json:"frames_buffered"`
+	FramesRepaired  int           `json:"frames_repaired,omitempty"`
 	StartedAt       time.Time     `json:"started_at"`
 	SealedAt        time.Time     `json:"sealed_at,omitempty"`
 	SealReason      string        `json:"seal_reason,omitempty"`
