@@ -54,6 +54,19 @@ func (s *Session) Feed(attemptID string, symbols []byte) (int, error) {
 	return s.decoder.Feed(attemptID, symbols)
 }
 
+// FeedRepair accepts retransmitted symbols for a closed decoder epoch. The
+// attempt does not need to hold the current lock — retransmissions arrive
+// out-of-band — but the decoder still validates that the attempt owns the
+// target epoch, and the repair runs on an isolated assembler so the live
+// epoch is never disturbed.
+func (s *Session) FeedRepair(attemptID string, epoch int64, symbols []byte) (decoder.RepairResult, error) {
+	return s.decoder.FeedRepair(attemptID, epoch, symbols)
+}
+
+func (s *Session) DecoderReport() decoder.GapReport {
+	return s.decoder.Report()
+}
+
 func (s *Session) Status() (attemptID string, locked bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

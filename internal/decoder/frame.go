@@ -35,10 +35,20 @@ func (a *Assembler) Push(epoch int64, symbols []byte) []recorder.Frame {
 	return frames
 }
 
+// Reset drops the partial frame left in the buffer and restarts the frame
+// sequence so each epoch numbers its frames from one. It returns the number
+// of discarded symbols, which the session reports as a gap at the next
+// sequence of the closed epoch.
 func (a *Assembler) Reset() int {
 	discarded := len(a.buffer)
 	a.buffer = a.buffer[:0]
+	a.sequence = 0
 	return discarded
+}
+
+// Pending returns the symbols still waiting for a complete frame.
+func (a *Assembler) Pending() int {
+	return len(a.buffer)
 }
 
 func EncodeTelemetry(counter uint64, size int) []byte {
